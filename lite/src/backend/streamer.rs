@@ -48,7 +48,7 @@ use crate::{
     metrics,
 };
 
-const DORMANT_TIMEOUT: Duration = Duration::from_secs(60);
+pub(super) const DORMANT_TIMEOUT: Duration = Duration::from_secs(60);
 // Rate-limit delete-on-empty scheduling and pad deadlines to cover the period.
 const DOE_DEADLINE_REFRESH_PERIOD: Duration = Duration::from_secs(600);
 
@@ -101,7 +101,6 @@ impl Spawner {
         } = self;
 
         let (msg_tx, msg_rx) = mpsc::unbounded_channel();
-
         let streamer = Streamer {
             db,
             stream_id,
@@ -122,6 +121,7 @@ impl Spawner {
             pending_appends: append::PendingAppends::new(),
             stable_pos: tail_pos,
             follow_tx: broadcast::Sender::new(super::FOLLOWER_MAX_LAG),
+            active_followers: 0,
             durability_notifier,
             bgtask_trigger_tx,
         };
@@ -174,6 +174,7 @@ struct Streamer {
     pending_appends: append::PendingAppends,
     stable_pos: StreamPosition,
     follow_tx: broadcast::Sender<Vec<Metered<SequencedRecord>>>,
+    active_followers: usize,
     durability_notifier: DurabilityNotifier,
     bgtask_trigger_tx: broadcast::Sender<BgtaskTrigger>,
 }
@@ -377,6 +378,23 @@ impl Streamer {
             }
             dormancy.as_mut().reset(Instant::now() + DORMANT_TIMEOUT);
             tokio::select! {
+                biased;
+                Some(res) = OptionFuture::from(self.db_writes_pending.front_mut()) => {
+                    drop(self.db_writes_pending.pop_front().expect("polled"));
+                    match res {
+                        Ok(submitted_append) => {
+                            if let Some(prev) = self.inflight_appends.back() {
+                                assert!(prev.db_seq < submitted_append.db_seq);
+                            }
+                            self.inflight_appends.push_back(submitted_append);
+                            self.subscribe_durability();
+                        }
+                        Err(db_err) => {
+                            self.pending_appends.on_durability_failed(db_err);
+                            break;
+                        }
+                    }
+                }
                 Some(msg) = msg_rx.recv() => {
                     match msg {
                         Message::Append {
@@ -394,7 +412,13 @@ impl Streamer {
                             reply_tx,
                         } => {
                             let reply = if start_seq_num == self.stable_pos.seq_num {
-                                Ok(self.follow_tx.subscribe())
+                                self.active_followers += 1;
+                                Ok(FollowReceiver {
+                                    _guard: FollowGuard {
+                                        msg_tx: self.msg_tx.clone(),
+                                    },
+                                    rx: self.follow_tx.subscribe(),
+                                })
                             } else {
                                 Err(self.stable_pos)
                             };
@@ -405,6 +429,10 @@ impl Streamer {
                         }
                         Message::Reconfigure { config } => {
                             self.config = config;
+                        }
+                        Message::FollowerDropped => {
+                            assert!(self.active_followers > 0, "follow guard count underflow");
+                            self.active_followers -= 1;
                         }
                         Message::DurabilityStatus(status) => {
                             match status {
@@ -424,24 +452,10 @@ impl Streamer {
                         }
                     }
                 }
-                Some(res) = OptionFuture::from(self.db_writes_pending.front_mut()) => {
-                    drop(self.db_writes_pending.pop_front().expect("polled"));
-                    match res {
-                        Ok(submitted_append) => {
-                            if let Some(prev) = self.inflight_appends.back() {
-                                assert!(prev.db_seq < submitted_append.db_seq);
-                            }
-                            self.inflight_appends.push_back(submitted_append);
-                            self.subscribe_durability();
-                        }
-                        Err(db_err) => {
-                            self.pending_appends.on_durability_failed(db_err);
-                            break;
-                        }
-                    }
-                }
                 _ = dormancy.as_mut() => {
-                    break;
+                    if self.active_followers == 0 {
+                        break;
+                    }
                 }
             }
         }
@@ -457,9 +471,7 @@ enum Message {
     },
     Follow {
         start_seq_num: SeqNum,
-        reply_tx: oneshot::Sender<
-            Result<broadcast::Receiver<Vec<Metered<SequencedRecord>>>, StreamPosition>,
-        >,
+        reply_tx: oneshot::Sender<Result<FollowReceiver, StreamPosition>>,
     },
     CheckTail {
         reply_tx: oneshot::Sender<StreamPosition>,
@@ -467,7 +479,31 @@ enum Message {
     Reconfigure {
         config: OptionalStreamConfig,
     },
+    FollowerDropped,
     DurabilityStatus(Result<u64, slatedb::CloseReason>),
+}
+
+pub(super) struct FollowReceiver {
+    _guard: FollowGuard,
+    rx: broadcast::Receiver<Vec<Metered<SequencedRecord>>>,
+}
+
+impl FollowReceiver {
+    pub async fn recv(
+        &mut self,
+    ) -> Result<Vec<Metered<SequencedRecord>>, broadcast::error::RecvError> {
+        self.rx.recv().await
+    }
+}
+
+struct FollowGuard {
+    msg_tx: mpsc::UnboundedSender<Message>,
+}
+
+impl Drop for FollowGuard {
+    fn drop(&mut self) {
+        let _ = self.msg_tx.send(Message::FollowerDropped);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -502,10 +538,7 @@ impl StreamerClient {
     pub async fn follow(
         &self,
         start_seq_num: SeqNum,
-    ) -> Result<
-        Result<broadcast::Receiver<Vec<Metered<SequencedRecord>>>, StreamPosition>,
-        StreamerMissingInActionError,
-    > {
+    ) -> Result<Result<FollowReceiver, StreamPosition>, StreamerMissingInActionError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.msg_tx
             .send(Message::Follow {
@@ -1034,6 +1067,7 @@ mod tests {
             pending_appends: append::PendingAppends::new(),
             stable_pos: StreamPosition::MIN,
             follow_tx: broadcast::Sender::new(super::super::FOLLOWER_MAX_LAG),
+            active_followers: 0,
             durability_notifier: DurabilityNotifier::spawn(&db),
             bgtask_trigger_tx,
         }
