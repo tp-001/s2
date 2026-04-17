@@ -224,12 +224,15 @@ impl SessionMessage {
         )?))
     }
 
-    pub fn encode(&self) -> Bytes {
+    pub fn encode(&self) -> std::io::Result<Bytes> {
         let encoded_size = FLAG_TOTAL_SIZE + self.payload_size();
-        assert!(
-            encoded_size <= MAX_FRAME_BYTES,
-            "payload exceeds encoder limit"
-        );
+        if encoded_size > MAX_FRAME_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "payload exceeds encoder limit",
+            ));
+        }
+
         let mut buf = BytesMut::with_capacity(LENGTH_PREFIX_SIZE + encoded_size);
         buf.put_uint(encoded_size as u64, 3);
         match self {
@@ -245,7 +248,7 @@ impl SessionMessage {
                 buf.extend_from_slice(msg.body.as_bytes());
             }
         }
-        buf.freeze()
+        Ok(buf.freeze())
     }
 
     fn decode_message(mut buf: Bytes) -> std::io::Result<Self> {
@@ -326,7 +329,13 @@ where
 
         match Pin::new(&mut self.inner).poll_next(cx) {
             Poll::Ready(Some(Ok(item))) => match SessionMessage::regular(self.compression, &item) {
-                Ok(msg) => Poll::Ready(Some(Ok(msg.encode()))),
+                Ok(msg) => match msg.encode() {
+                    Ok(bytes) => Poll::Ready(Some(Ok(bytes))),
+                    Err(err) => {
+                        self.terminated = true;
+                        Poll::Ready(Some(Err(err)))
+                    }
+                },
                 Err(err) => {
                     self.terminated = true;
                     Poll::Ready(Some(Err(err)))
@@ -334,8 +343,7 @@ where
             },
             Poll::Ready(Some(Err(e))) => {
                 self.terminated = true;
-                let bytes = SessionMessage::Terminal(e.into()).encode();
-                Poll::Ready(Some(Ok(bytes)))
+                Poll::Ready(Some(SessionMessage::Terminal(e.into()).encode()))
             }
             Poll::Ready(None) => {
                 self.terminated = true;
@@ -421,6 +429,21 @@ mod test {
         }
     }
 
+    #[derive(Debug, Clone)]
+    struct OwnedTestError {
+        status: u16,
+        body: String,
+    }
+
+    impl From<OwnedTestError> for TerminalMessage {
+        fn from(val: OwnedTestError) -> Self {
+            TerminalMessage {
+                status: val.status,
+                body: val.body,
+            }
+        }
+    }
+
     fn decode_once(bytes: &Bytes) -> io::Result<SessionMessage> {
         let mut decoder = FrameDecoder;
         let mut buf = BytesMut::from(bytes.as_ref());
@@ -466,7 +489,7 @@ mod test {
         ) {
             let proto = TestProto::new(payload.clone());
             let msg = SessionMessage::regular(algo, &proto).unwrap();
-            let encoded = msg.encode();
+            let encoded = msg.encode().unwrap();
             let decoded = decode_once(&encoded).unwrap();
 
             prop_assert!(matches!(decoded, SessionMessage::Regular(_)));
@@ -492,7 +515,7 @@ mod test {
         ) {
             let proto = TestProto::new(payload);
             let msg = SessionMessage::regular(algo, &proto).unwrap();
-            let encoded = msg.encode();
+            let encoded = msg.encode().unwrap();
             let expected = decode_once(&encoded).unwrap();
 
             let chunks = chunk_bytes(&encoded, &chunk_pattern);
@@ -554,7 +577,7 @@ mod test {
     fn regular_session_message_round_trips() {
         let proto = TestProto::new(vec![1, 2, 3, 4]);
         let msg = SessionMessage::regular(CompressionAlgorithm::None, &proto).unwrap();
-        let encoded = msg.encode();
+        let encoded = msg.encode().unwrap();
         let decoded = decode_once(&encoded).unwrap();
 
         match decoded {
@@ -574,7 +597,7 @@ mod test {
             body: "short-circuit".to_string(),
         };
         let msg = SessionMessage::from(terminal.clone());
-        let encoded = msg.encode();
+        let encoded = msg.encode().unwrap();
         let decoded = decode_once(&encoded).unwrap();
 
         match decoded {
@@ -586,10 +609,25 @@ mod test {
     }
 
     #[test]
+    fn terminal_session_message_rejects_oversized_body() {
+        let terminal = TerminalMessage {
+            status: 500,
+            body: "x".repeat(MAX_FRAME_BYTES - FLAG_TOTAL_SIZE - STATUS_CODE_SIZE + 1),
+        };
+        let msg = SessionMessage::from(terminal);
+
+        let err = msg
+            .encode()
+            .expect_err("oversized terminal body should fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("payload exceeds encoder limit"));
+    }
+
+    #[test]
     fn frame_decoder_waits_for_complete_frame() {
         let proto = TestProto::new(vec![9, 9, 9]);
         let msg = SessionMessage::regular(CompressionAlgorithm::None, &proto).unwrap();
-        let encoded = msg.encode();
+        let encoded = msg.encode().unwrap();
         let mut decoder = FrameDecoder;
 
         let split_idx = encoded.len() - 1;
@@ -623,14 +661,15 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "encoder limit")]
     fn session_message_encode_rejects_frames_over_limit() {
         let data = CompressedData {
             compression: CompressionAlgorithm::None,
             payload: Bytes::from(vec![0u8; MAX_FRAME_BYTES]),
         };
         let msg = SessionMessage::from(data);
-        let _ = msg.encode();
+        let err = msg.encode().expect_err("oversized frame should fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("payload exceeds encoder limit"));
     }
 
     #[test]
@@ -667,7 +706,7 @@ mod test {
         let payload = vec![42; 1_200_000];
         let proto = TestProto::new(payload.clone());
         let msg = SessionMessage::regular(CompressionAlgorithm::Gzip, &proto).unwrap();
-        let encoded = msg.encode();
+        let encoded = msg.encode().unwrap();
         let decoded = decode_once(&encoded).unwrap();
 
         match decoded {
@@ -686,7 +725,7 @@ mod test {
         let payload = vec![7; 1_100_000];
         let proto = TestProto::new(payload.clone());
         let msg = SessionMessage::regular(CompressionAlgorithm::Zstd, &proto).unwrap();
-        let encoded = msg.encode();
+        let encoded = msg.encode().unwrap();
         let decoded = decode_once(&encoded).unwrap();
 
         match decoded {
@@ -756,7 +795,7 @@ mod test {
     fn compress_allows_payload_at_exact_limit_without_encode_panic() {
         let payload = vec![0; MAX_DECOMPRESSED_PAYLOAD_BYTES];
         let data = CompressedData::compress(CompressionAlgorithm::None, payload).unwrap();
-        let encoded = SessionMessage::from(data).encode();
+        let encoded = SessionMessage::from(data).encode().unwrap();
         assert_eq!(encoded.len(), LENGTH_PREFIX_SIZE + MAX_FRAME_BYTES);
     }
 
@@ -816,6 +855,33 @@ mod test {
             SessionMessage::Terminal(term) => {
                 assert_eq!(term.status, 500);
                 assert_eq!(term.body, "boom");
+            }
+        }
+    }
+
+    #[test]
+    fn framed_message_stream_returns_error_for_oversized_terminal_message() {
+        let items: Vec<Result<TestProto, OwnedTestError>> = vec![Err(OwnedTestError {
+            status: 500,
+            body: "x".repeat(MAX_FRAME_BYTES - FLAG_TOTAL_SIZE - STATUS_CODE_SIZE + 1),
+        })];
+        let mut stream =
+            FramedMessageStream::new(CompressionAlgorithm::None, futures::stream::iter(items));
+
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+
+        match Pin::new(&mut stream).poll_next(&mut cx) {
+            Poll::Ready(Some(Err(err))) => {
+                assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+                assert!(err.to_string().contains("payload exceeds encoder limit"));
+            }
+            other => panic!("expected terminal encoding error, got {other:?}"),
+        }
+
+        match Pin::new(&mut stream).poll_next(&mut cx) {
+            Poll::Ready(None) => {}
+            other => {
+                panic!("expected stream to terminate after terminal encoding error, got {other:?}")
             }
         }
     }

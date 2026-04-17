@@ -424,9 +424,8 @@ impl BasinClient {
 
         let compression = self.config.compression.into();
 
-        let encoded_stream = inputs.map(move |input| {
-            s2s::SessionMessage::regular(compression, &input).map(|msg| msg.encode())
-        });
+        let encoded_stream =
+            inputs.map(move |input| s2s::SessionMessage::regular(compression, &input)?.encode());
 
         let body = client::Body::wrap_stream(encoded_stream);
         let body = match frame_signal {
